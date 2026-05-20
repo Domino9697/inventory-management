@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from functools import reduce
 import random
 import uuid
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
@@ -350,62 +351,77 @@ class SubmittedRestockOrder(BaseModel):
     items: List[SubmittedRestockOrderItem]
     max_lead_time_days: int
 
+DEFAULT_UNIT_COST = 25.0
+
+
+def _average_unit_cost(items: List[dict]) -> float:
+    if not items:
+        return DEFAULT_UNIT_COST
+    return round(sum(item["unit_cost"] for item in items) / len(items), 2)
+
+
+def _shortfall(forecasted: int, current: int, current_demand: int) -> int:
+    """Stock-based shortfall, falling back to demand growth when stock covers forecast."""
+    stock_gap = max(forecasted - current, 0)
+    return stock_gap or max(forecasted - current_demand, 0)
+
+
+def _build_candidate(forecast: dict, inventory_by_sku: dict, avg_cost: float) -> Optional[dict]:
+    """Return a restock candidate for a forecast, or None if no restock is needed."""
+    if forecast.get("trend") == "decreasing":
+        return None
+
+    forecasted = forecast["forecasted_demand"]
+    inv = inventory_by_sku.get(forecast["item_sku"])
+
+    if inv is None:
+        current, shortfall = 0, forecasted
+        unit_cost, category, warehouse = avg_cost, None, None
+    else:
+        current = inv["quantity_on_hand"]
+        shortfall = _shortfall(forecasted, current, forecast.get("current_demand", forecasted))
+        unit_cost = inv["unit_cost"]
+        category, warehouse = inv.get("category"), inv.get("warehouse")
+
+    if shortfall <= 0:
+        return None
+
+    return {
+        "sku": forecast["item_sku"],
+        "name": forecast["item_name"],
+        "category": category,
+        "warehouse": warehouse,
+        "current_stock": current,
+        "forecasted_demand": forecasted,
+        "shortfall": shortfall,
+        "unit_cost": unit_cost,
+    }
+
+
+def _allocate(state: Tuple[float, List[dict]], candidate: dict) -> Tuple[float, List[dict]]:
+    """Greedy budget allocation: take as much of the candidate as the remaining budget supports."""
+    remaining, selected = state
+    qty = min(candidate["shortfall"], int(remaining // candidate["unit_cost"]))
+    if qty <= 0:
+        return state
+    line_total = round(qty * candidate["unit_cost"], 2)
+    return remaining - line_total, [
+        *selected,
+        {**candidate, "recommended_quantity": qty, "line_total": line_total},
+    ]
+
+
 def _build_recommendations(budget: float) -> List[dict]:
-    inv_by_sku = {item["sku"]: item for item in inventory_items}
-    avg_cost = round(sum(i["unit_cost"] for i in inventory_items) / len(inventory_items), 2) if inventory_items else 25.0
-    candidates = []
-    for f in demand_forecasts:
-        if f.get("trend") == "decreasing":
-            continue
-        inv = inv_by_sku.get(f["item_sku"])
-        forecasted = f["forecasted_demand"]
-        if inv:
-            current = inv["quantity_on_hand"]
-            shortfall = max(forecasted - current, 0)
-            if shortfall <= 0:
-                shortfall = max(forecasted - f.get("current_demand", forecasted), 0)
-            unit_cost = inv["unit_cost"]
-            category = inv.get("category")
-            warehouse = inv.get("warehouse")
-        else:
-            current = 0
-            shortfall = forecasted
-            unit_cost = avg_cost
-            category = None
-            warehouse = None
-        if shortfall <= 0:
-            continue
-        candidates.append({
-            "sku": f["item_sku"],
-            "name": f["item_name"],
-            "category": category,
-            "warehouse": warehouse,
-            "current_stock": current,
-            "forecasted_demand": forecasted,
-            "shortfall": shortfall,
-            "unit_cost": unit_cost,
-        })
+    inventory_by_sku = {item["sku"]: item for item in inventory_items}
+    avg_cost = _average_unit_cost(inventory_items)
 
-    candidates.sort(key=lambda c: c["forecasted_demand"], reverse=True)
+    candidates = sorted(
+        (c for c in (_build_candidate(f, inventory_by_sku, avg_cost) for f in demand_forecasts) if c),
+        key=lambda c: c["forecasted_demand"],
+        reverse=True,
+    )
 
-    selected = []
-    remaining = budget
-    for c in candidates:
-        if remaining <= 0:
-            break
-        max_affordable = int(remaining // c["unit_cost"])
-        if max_affordable <= 0:
-            continue
-        qty = min(c["shortfall"], max_affordable)
-        if qty <= 0:
-            continue
-        line_total = round(qty * c["unit_cost"], 2)
-        selected.append({
-            **c,
-            "recommended_quantity": qty,
-            "line_total": line_total,
-        })
-        remaining -= line_total
+    _, selected = reduce(_allocate, candidates, (budget, []))
     return selected
 
 @app.get("/api/restocking/recommendations", response_model=List[RestockRecommendation])
