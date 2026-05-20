@@ -8,6 +8,48 @@
     <div v-if="loading" class="loading">{{ t('common.loading') }}</div>
     <div v-else-if="error" class="error">{{ error }}</div>
     <div v-else>
+      <div v-if="submittedOrders.length > 0" class="card">
+        <div class="card-header">
+          <h3 class="card-title">Submitted Restocking Orders ({{ submittedOrders.length }})</h3>
+        </div>
+        <div class="table-container">
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th class="col-order-number">Order #</th>
+                <th class="col-date">Submitted Date</th>
+                <th class="col-items">Items</th>
+                <th class="col-value">Total Value</th>
+                <th>Max Lead Time</th>
+                <th class="col-date">Earliest Expected</th>
+                <th class="col-status">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="order in submittedOrders" :key="order.order_number">
+                <td class="col-order-number"><strong>{{ order.order_number }}</strong></td>
+                <td class="col-date">{{ formatDate(order.submitted_date) }}</td>
+                <td class="col-items">
+                  <details class="items-details">
+                    <summary class="items-summary">{{ order.items.length }} item{{ order.items.length !== 1 ? 's' : '' }}</summary>
+                    <div class="items-dropdown">
+                      <div v-for="item in order.items" :key="item.sku" class="item-entry">
+                        <span class="item-name">{{ item.sku }} — {{ item.name }}</span>
+                        <span class="item-meta">{{ item.quantity }} &times; {{ currencySymbol }}{{ item.unit_cost }} &mdash; lead: {{ item.lead_time_days }}d &rarr; {{ item.expected_delivery }}</span>
+                      </div>
+                    </div>
+                  </details>
+                </td>
+                <td class="col-value"><strong>{{ currencySymbol }}{{ order.total_value.toLocaleString() }}</strong></td>
+                <td>{{ order.max_lead_time_days }} days</td>
+                <td class="col-date">{{ formatDate(earliestExpected(order)) }}</td>
+                <td class="col-status"><span class="badge info">Submitted</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="stats-grid">
         <div class="stat-card success">
           <div class="stat-label">{{ t('status.delivered') }}</div>
@@ -95,6 +137,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const submittedOrders = ref([])
 
     // Use shared filters
     const {
@@ -105,11 +148,22 @@ export default {
       getCurrentFilters
     } = useFilters()
 
+    const loadSubmittedOrders = async () => {
+      try {
+        submittedOrders.value = await api.getSubmittedRestockOrders()
+      } catch (err) {
+        console.error('Failed to load submitted restock orders:', err)
+      }
+    }
+
     const loadOrders = async () => {
       try {
         loading.value = true
         const filters = getCurrentFilters()
-        const fetchedOrders = await api.getOrders(filters)
+        const [fetchedOrders] = await Promise.all([
+          api.getOrders(filters),
+          loadSubmittedOrders()
+        ])
 
         // Sort orders by order_date (earliest first)
         orders.value = fetchedOrders.sort((a, b) => {
@@ -143,6 +197,14 @@ export default {
       return statusMap[status] || 'info'
     }
 
+    const earliestExpected = (order) => {
+      if (!order.items || order.items.length === 0) return null
+      return order.items
+        .map(i => i.expected_delivery)
+        .filter(Boolean)
+        .sort()[0]
+    }
+
     const formatDate = (dateString) => {
       const { currentLocale } = useI18n()
       const locale = currentLocale.value === 'ja' ? 'ja-JP' : 'en-US'
@@ -160,6 +222,8 @@ export default {
       loading,
       error,
       orders,
+      submittedOrders,
+      earliestExpected,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
